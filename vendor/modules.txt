@@ -76,6 +76,9 @@ github.com/fsnotify/fsnotify
 # github.com/fvbommel/sortorder v1.1.0
 ## explicit; go 1.13
 github.com/fvbommel/sortorder
+# github.com/glenn-brown/golang-pkg-pcre v0.0.0-20120522223659-48bb82a8b8ce
+## explicit
+github.com/glenn-brown/golang-pkg-pcre/src/pkg/pcre
 # github.com/go-asn1-ber/asn1-ber v1.5.4
 ## explicit; go 1.13
 github.com/go-asn1-ber/asn1-ber
