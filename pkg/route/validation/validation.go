@@ -22,6 +22,8 @@ import (
 	routev1 "github.com/openshift/api/route/v1"
 	"github.com/openshift/library-go/pkg/authorization/authorizationutil"
 	routecommon "github.com/openshift/library-go/pkg/route"
+
+	"github.com/glenn-brown/golang-pkg-pcre/src/pkg/pcre"
 )
 
 const (
@@ -60,6 +62,8 @@ const (
 	permittedResponseHeaderValueErrorMessage = "Either header value provided is not in correct format or the converter specified is not allowed. The dynamic header value  may use HAProxy's %[] syntax and otherwise must be a valid HTTP header value as defined in https://datatracker.ietf.org/doc/html/rfc7230#section-3.2 Sample fetchers allowed are res.hdr, ssl_c_der. Converters allowed are lower, base64."
 	// routerServiceAccount is used to validate RBAC permissions for externalCertificate
 	routerServiceAccount = "system:serviceaccount:openshift-ingress:router"
+	// rewriteTargetAnnotation is route annotation used to specify a rewrite target.
+	rewriteTargetAnnotation = "haproxy.router.openshift.io/rewrite-target"
 )
 
 var (
@@ -212,7 +216,119 @@ func validateRoute(ctx context.Context, route *routev1.Route, checkHostname bool
 		result = append(result, errs...)
 	}
 
+	if errs := ValidatePathWithRewriteTargetAnnotation(route, specPath.Child("path")); len(errs) != 0 {
+		result = append(result, errs...)
+	}
+
 	return result
+}
+
+// ValidatePathWithRewriteTargetAnnotation tests the spec.path field for invalid syntax when the
+// rewrite-target annotation is set. This addresses OCPBUGS-27741 by rejecting invalid spec.path
+// values, while preserving compatibility for users who may have depended on the unintended
+// behavior caused by the bug.
+func ValidatePathWithRewriteTargetAnnotation(route *routev1.Route, fldPath *field.Path) field.ErrorList {
+	result := field.ErrorList{}
+	if rewriteVal, ok := route.Annotations[rewriteTargetAnnotation]; ok {
+		// Since regex compilation is expensive, first determine if there are any regex meta characters in spec.path.
+		if containsRegexMetaChars(route.Spec.Path) {
+			// Replicate the regex used in the haproxy-config.template.
+			var regex string
+			if rewriteVal == "/" {
+				regex = fmt.Sprintf("^%s/?(.*)$", removeMatchingQuotes(route.Spec.Path))
+			} else {
+				regex = fmt.Sprintf("^%s?(.*)$", removeMatchingQuotes(route.Spec.Path))
+			}
+			if err := validateForbiddenFirstChar(regex); err != nil {
+				result = append(result, field.Invalid(fldPath, route.Spec.Path, fmt.Sprintf("cannot contain $ followed by a special character while %s is specified", rewriteTargetAnnotation)))
+			}
+			if err := validateNoBackreferences(regex); err != nil {
+				result = append(result, field.Invalid(fldPath, route.Spec.Path, fmt.Sprintf("cannot contain backreferences characters while %s is specified", rewriteTargetAnnotation)))
+			}
+			if _, err := pcre.Compile(regex, 0); err != nil {
+				result = append(result, field.Invalid(fldPath, route.Spec.Path, fmt.Sprintf("cannot contain invalid regex characters while %s is specified", rewriteTargetAnnotation)))
+			}
+		}
+		if err := validateIncompleteHexEscapes(route.Spec.Path); err != nil {
+			result = append(result, field.Invalid(fldPath, route.Spec.Path, fmt.Sprintf("cannot contain incomplete hex while %s is specified", rewriteTargetAnnotation)))
+		}
+		// These validations are to protect against HAProxy config file level errors.
+		if hasUnmatchedSingleQuotes(route.Spec.Path) {
+			result = append(result, field.Invalid(fldPath, route.Spec.Path, fmt.Sprintf("cannot contain unmatched ' while %s is specified", rewriteTargetAnnotation)))
+		}
+		if hasUnmatchedDoubleQuotes(route.Spec.Path) {
+			result = append(result, field.Invalid(fldPath, route.Spec.Path, fmt.Sprintf("cannot contain unmatched \" while %s is specified", rewriteTargetAnnotation)))
+		}
+		if strings.Contains(route.Spec.Path, "#") {
+			result = append(result, field.Invalid(fldPath, route.Spec.Path, fmt.Sprintf("cannot contain # while %s is specified", rewriteTargetAnnotation)))
+		}
+		if strings.Contains(route.Spec.Path, "\n") || strings.Contains(route.Spec.Path, "\r") {
+			result = append(result, field.Invalid(fldPath, route.Spec.Path, fmt.Sprintf("cannot contain newlines while %s is specified", rewriteTargetAnnotation)))
+		}
+	}
+	return result
+}
+
+func validateForbiddenFirstChar(input string) error {
+	// Define a list of forbidden sequences
+	forbiddenSequences := []string{`$"`}
+
+	// Check if any forbidden sequence is present in the input
+	for _, seq := range forbiddenSequences {
+		if strings.Contains(input, seq) {
+			return fmt.Errorf("invalid pattern: contains forbidden sequence %q", seq)
+		}
+	}
+	return nil
+}
+
+// removeMatchingQuotes removes matching single quotes from both ends of a string
+// if they are not escaped with a backslash.
+func removeMatchingQuotes(s string) string {
+	var result strings.Builder
+	escape := false
+
+	for _, char := range s {
+		if char == '\'' && !escape {
+			// Skip unescaped single quote
+			continue
+		}
+
+		if char == '\\' && !escape {
+			// Set escape flag if backslash is encountered
+			escape = true
+		} else {
+			escape = false // Reset escape flag for any other character
+		}
+
+		// Add character to the result
+		result.WriteRune(char)
+	}
+	return result.String()
+}
+
+// validateIncompleteHexEscapes checks if the string contains incomplete hexadecimal escape sequences (\x).
+func validateIncompleteHexEscapes(input string) error {
+	// Regular expression to match incomplete hexadecimal escape sequences
+	// Matches any "\x" not followed by exactly two hexadecimal characters
+	incompleteHexPattern := regexp.MustCompile(`\\x([^0-9a-fA-F]|.{0,1}$)`)
+
+	// Check if there are any incomplete hexadecimal escape sequences in the input
+	if incompleteHexPattern.MatchString(input) {
+		return fmt.Errorf("incomplete hexadecimal escape sequence detected")
+	}
+
+	return nil
+}
+
+func validateNoBackreferences(pattern string) error {
+	// A regex pattern to detect backreferences like \1, \2, \3, etc.
+	backreferencePattern := regexp.MustCompile(`\\\d+`)
+
+	if backreferencePattern.MatchString(pattern) {
+		return fmt.Errorf("invalid pattern: backreferences are not allowed")
+	}
+	return nil
 }
 
 func ValidateRouteUpdate(ctx context.Context, route *routev1.Route, older *routev1.Route, sarc routecommon.SubjectAccessReviewCreator, secrets corev1client.SecretsGetter, opts routecommon.RouteValidationOptions) field.ErrorList {
@@ -526,10 +642,77 @@ func validateKubeFinalizerName(stringValue string, fldPath *field.Path) field.Er
 }
 
 func Warnings(route *routev1.Route) []string {
+	var warnings []string
 	if len(route.Spec.Host) != 0 && len(route.Spec.Subdomain) != 0 {
-		var warnings []string
 		warnings = append(warnings, "spec.host is set; spec.subdomain may be ignored")
-		return warnings
 	}
-	return nil
+	warnings = append(warnings, warnPathWithRewriteTargetAnnotation(route)...)
+
+	return warnings
+}
+
+// warnPathWithRewriteTargetAnnotation returns warnings if a provided route has
+// the rewrite-target annotation set, and the spec.path contains invalid
+// values that, while valid, may lead to unintended behavior.
+func warnPathWithRewriteTargetAnnotation(route *routev1.Route) []string {
+	var warnings []string
+	if _, ok := route.Annotations[rewriteTargetAnnotation]; ok {
+		if containsRegexMetaChars(route.Spec.Path) {
+			warnings = append(warnings, fmt.Sprintf("spec.path contains regex meta characters which may lead to unexpected behavior using %s", rewriteTargetAnnotation))
+		}
+		if strings.Contains(route.Spec.Path, `'`) {
+			warnings = append(warnings, fmt.Sprintf("spec.path contains a ' which may lead to unexpected behavior using %s", rewriteTargetAnnotation))
+		}
+		if strings.Contains(route.Spec.Path, `"`) {
+			warnings = append(warnings, fmt.Sprintf("spec.path contains a \" which may lead to unexpected behavior using %s", rewriteTargetAnnotation))
+		}
+	}
+	return warnings
+}
+
+// hasUnmatchedSingleQuotes returns true if input string has unmatched single quotes.
+func hasUnmatchedSingleQuotes(input string) bool {
+	singleQuoteCount := strings.Count(input, `'`)
+	if singleQuoteCount%2 != 0 {
+		return true
+	}
+	return false
+}
+
+// hasUnmatchedDoubleQuotes returns true if input string has unmatched double quotes.
+func hasUnmatchedDoubleQuotes(input string) bool {
+	unescapedQuoteCount := 0
+	escaped := false
+	inSingleQuotes := false
+
+	for _, char := range input {
+		if char == '\\' {
+			// Toggle escaped flag if we encounter a backslash
+			escaped = !escaped
+		} else {
+			// Track if we are inside single quotes
+			if char == '\'' && !escaped {
+				inSingleQuotes = !inSingleQuotes
+			} else if char == '"' && !escaped && !inSingleQuotes {
+				// Count only unescaped double quotes that are outside single quotes
+				unescapedQuoteCount++
+			}
+			// Reset escaped flag for any character that isn’t a backslash
+			escaped = false
+		}
+	}
+
+	// If the count of unescaped double quotes is odd, they are unmatched
+	return unescapedQuoteCount%2 != 0
+}
+
+// containsRegexMetaChars returns true if the input string contains a regex meta character.
+func containsRegexMetaChars(input string) bool {
+	regexMetaChars := `.+*?^$()[]{}|\`
+	for _, char := range regexMetaChars {
+		if strings.ContainsRune(input, char) {
+			return true
+		}
+	}
+	return false
 }
